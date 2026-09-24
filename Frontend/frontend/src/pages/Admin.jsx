@@ -146,9 +146,13 @@ function AdminCategorias() {
 function AdminUsuarios() {
   const { user: currentUser } = useAuth();
   const [reloadKey, setReloadKey] = useState(0);
-  const loadUsers = useCallback(() => authService.listUsers(), [reloadKey]);
-  const usersReq = useFetch(loadUsers, reloadKey);
+  const [page, setPage] = useState(1);
+  const loadUsers = useCallback(() => authService.listUsers(page), [reloadKey, page]);
+  const usersReq = useFetch(loadUsers, reloadKey + '-' + page);
   const reload = () => setReloadKey(k => k + 1);
+
+  const total = usersReq.data?.total || 0;
+  const totalPages = Math.ceil(total / 100) || 1;
 
   async function cambiarRol(id, rol) {
     await authService.setRol(id, rol);
@@ -163,34 +167,55 @@ function AdminUsuarios() {
   return <section className="admin-section">
     <div className="section-heading"><h2>Usuarios</h2></div>
     <RequestState {...usersReq}/>
-    {!usersReq.loading && !usersReq.error && <table className="admin-table">
-      <thead><tr><th>Nombre</th><th>Correo</th><th>Estado</th><th>Rol</th><th/></tr></thead>
-      <tbody>{(usersReq.data?.data || []).map(u => <tr key={u.id}>
-        <td>{u.nombre}</td><td>{u.email}</td>
-        <td><span className={u.estado === 'inactivo' ? 'sold-out' : 'stock'}>{u.estado}</span></td>
-        <td>{u.rol}</td>
-        <td className="admin-actions">
-          {String(u.id) !== String(currentUser.id) && <button className="text-button" onClick={() => cambiarRol(u.id, u.rol === 'admin' ? 'usuario' : 'admin')}>{u.rol === 'admin' ? 'Quitar admin' : 'Hacer admin'}</button>}
-          <button className="text-button" onClick={() => cambiarEstado(u.id, u.estado === 'inactivo' ? 'activo' : 'inactivo')}>{u.estado === 'inactivo' ? 'Reactivar' : 'Desactivar'}</button>
-        </td>
-      </tr>)}</tbody>
-    </table>}
+    {!usersReq.loading && !usersReq.error && <>
+      <table className="admin-table">
+        <thead><tr><th>Nombre</th><th>Correo</th><th>Estado</th><th>Rol</th><th/></tr></thead>
+        <tbody>{(usersReq.data?.data || []).map(u => <tr key={u.id}>
+          <td>{u.nombre}</td><td>{u.email}</td>
+          <td><span className={u.estado === 'inactivo' ? 'sold-out' : 'stock'}>{u.estado}</span></td>
+          <td>{u.rol}</td>
+          <td className="admin-actions">
+            {String(u.id) !== String(currentUser.id) && <button className="text-button" onClick={() => cambiarRol(u.id, u.rol === 'admin' ? 'usuario' : 'admin')}>{u.rol === 'admin' ? 'Quitar admin' : 'Hacer admin'}</button>}
+            <button className="text-button" onClick={() => cambiarEstado(u.id, u.estado === 'inactivo' ? 'activo' : 'inactivo')}>{u.estado === 'inactivo' ? 'Reactivar' : 'Desactivar'}</button>
+          </td>
+        </tr>)}</tbody>
+      </table>
+      {totalPages > 1 && <div className="pagination">
+        <button className="text-button" disabled={page === 1} onClick={() => setPage(p => p - 1)}>← Anterior</button>
+        <span>Página {page} de {totalPages} ({total} usuarios)</span>
+        <button className="text-button" disabled={page >= totalPages} onClick={() => setPage(p => p + 1)}>Siguiente →</button>
+      </div>}
+    </>}
   </section>;
 }
 
 function AdminOrdenes() {
-  const ordersReq = useFetch(ventasService.todas);
+  const [page, setPage] = useState(1);
+  const loadOrdenes = useCallback(() => ventasService.todas(page), [page]);
+  const ordersReq = useFetch(loadOrdenes, page);
+
+  const total = ordersReq.data?.total || 0;
+  const totalPages = Math.ceil(total / 100) || 1;
+  const rows = ordersReq.data?.data || [];
+
   return <section className="admin-section">
     <div className="section-heading"><h2>Órdenes y ventas</h2></div>
     <RequestState {...ordersReq}/>
-    {!ordersReq.loading && !ordersReq.error && (ordersReq.data?.length
-      ? <table className="admin-table">
-          <thead><tr><th>ID</th><th>Usuario</th><th>Total</th><th>Estado</th><th>Fecha</th></tr></thead>
-          <tbody>{ordersReq.data.map(v => <tr key={v._id}>
-            <td>{v._id}</td><td>{v.usuario_id}</td><td>{money(v.total)}</td><td>{v.estado}</td>
-            <td>{new Date(v.creado_en).toLocaleString('es-PE')}</td>
-          </tr>)}</tbody>
-        </table>
+    {!ordersReq.loading && !ordersReq.error && (rows.length
+      ? <>
+          <table className="admin-table">
+            <thead><tr><th>ID</th><th>Usuario</th><th>Total</th><th>Estado</th><th>Fecha</th></tr></thead>
+            <tbody>{rows.map(v => <tr key={v._id}>
+              <td>{v._id}</td><td>{v.usuario_id}</td><td>{money(v.total)}</td><td>{v.estado}</td>
+              <td>{new Date(v.creado_en).toLocaleString('es-PE')}</td>
+            </tr>)}</tbody>
+          </table>
+          {totalPages > 1 && <div className="pagination">
+            <button className="text-button" disabled={page === 1} onClick={() => setPage(p => p - 1)}>← Anterior</button>
+            <span>Página {page} de {totalPages} ({total} órdenes)</span>
+            <button className="text-button" disabled={page >= totalPages} onClick={() => setPage(p => p + 1)}>Siguiente →</button>
+          </div>}
+        </>
       : <div className="notice"><p>Todavía no hay órdenes registradas.</p></div>)}
   </section>;
 }

@@ -35,8 +35,8 @@ export const authService = {
     return address;
   },
   // --- Administración (solo admin) ---
-  async listUsers() {
-    if (!isDemo) return api('/usuarios?page=1&limit=100');
+  async listUsers(page = 1) {
+    if (!isDemo) return api(`/usuarios?page=${page}&limit=100`);
     return { data: users.map(publicUser), total: users.length, page: 1, limit: users.length };
   },
   async setRol(id, rol) {

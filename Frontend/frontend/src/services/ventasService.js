@@ -22,12 +22,9 @@ export const ventasService = {
     }
     return demoVentas.filter(v => String(v.usuario_id) === String(usuarioId));
   },
-  async todas() {
-    if (!isDemo) {
-      const res = await api('/ventas?page=1&limit=100');
-      return res.data || [];
-    }
-    return demoVentas;
+  async todas(page = 1) {
+    if (!isDemo) return api(`/ventas?page=${page}&limit=100`);
+    return { data: demoVentas, total: demoVentas.length };
   },
   async obtener(id) {
     if (!isDemo) {
