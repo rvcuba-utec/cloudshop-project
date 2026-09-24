@@ -1,0 +1,838 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudShop — Despliegue completo automatizado. Sin parametros.
+  Crea VPC, Security Groups, 4 EC2 (datos/app-1/app-2/ingesta),
+  ALB con path-based routing, S3, Glue, y Amplify (frontend React).
+
+Resources:
+
+  # ===========================================================================
+  # 1. RED
+  # ===========================================================================
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - { Key: Name, Value: cloudshop-vpc }
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: cloudshop-igw }
+
+  IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref IGW
+
+  # Subred principal — EC2 instances (AZ-a, 10.0.1.0/24)
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: cloudshop-subnet-publica }
+
+  # Segunda subred — requerida por el ALB (debe estar en AZ distinta)
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: cloudshop-subnet-publica-2 }
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - { Key: Name, Value: cloudshop-rt-publica }
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttach
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+
+  SubnetRTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  SubnetRTA2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref RouteTable
+
+  # ===========================================================================
+  # 2. SECURITY GROUPS
+  # ===========================================================================
+
+  SGAlb:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: cloudshop-sg-alb
+      GroupDescription: ALB — acepta trafico HTTP publico en puerto 80
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+      Tags:
+        - { Key: Name, Value: cloudshop-sg-alb }
+
+  SGApp:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: cloudshop-sg-app
+      GroupDescription: MV app — SSH publico y puertos de microservicios desde ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22,   ToPort: 22,   CidrIp: 0.0.0.0/0 }
+        # Puertos de microservicios: desde ALB (trafico normal) y desde internet (swagger-ui)
+        - { IpProtocol: tcp, FromPort: 8000, ToPort: 8000, SourceSecurityGroupId: !Ref SGAlb }
+        - { IpProtocol: tcp, FromPort: 8000, ToPort: 8000, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, SourceSecurityGroupId: !Ref SGAlb }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 8001, ToPort: 8001, SourceSecurityGroupId: !Ref SGAlb }
+        - { IpProtocol: tcp, FromPort: 8001, ToPort: 8001, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 8002, ToPort: 8002, SourceSecurityGroupId: !Ref SGAlb }
+        - { IpProtocol: tcp, FromPort: 8002, ToPort: 8002, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 8003, ToPort: 8003, SourceSecurityGroupId: !Ref SGAlb }
+        - { IpProtocol: tcp, FromPort: 8003, ToPort: 8003, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 8081, ToPort: 8081, CidrIp: 0.0.0.0/0 }
+      Tags:
+        - { Key: Name, Value: cloudshop-sg-app }
+
+  SGIngesta:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: cloudshop-sg-ingesta
+      GroupDescription: MV ingesta — solo SSH
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: 0.0.0.0/0 }
+      Tags:
+        - { Key: Name, Value: cloudshop-sg-ingesta }
+
+  SGBd:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: cloudshop-sg-bd
+      GroupDescription: MV datos — puertos de BD solo desde app e ingesta
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22,    ToPort: 22,    SourceSecurityGroupId: !Ref SGApp }
+        - { IpProtocol: tcp, FromPort: 3306,  ToPort: 3306,  SourceSecurityGroupId: !Ref SGApp }
+        - { IpProtocol: tcp, FromPort: 5432,  ToPort: 5432,  SourceSecurityGroupId: !Ref SGApp }
+        - { IpProtocol: tcp, FromPort: 27017, ToPort: 27017, SourceSecurityGroupId: !Ref SGApp }
+        - { IpProtocol: tcp, FromPort: 3306,  ToPort: 3306,  SourceSecurityGroupId: !Ref SGIngesta }
+        - { IpProtocol: tcp, FromPort: 5432,  ToPort: 5432,  SourceSecurityGroupId: !Ref SGIngesta }
+        - { IpProtocol: tcp, FromPort: 27017, ToPort: 27017, SourceSecurityGroupId: !Ref SGIngesta }
+      Tags:
+        - { Key: Name, Value: cloudshop-sg-bd }
+
+  # ===========================================================================
+  # 3. S3 (data lake)
+  # ===========================================================================
+
+  S3DataLake:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: cloudshop-data-lake-2026-utec-mr-cs2032-v2
+
+  # ===========================================================================
+  # 4. GLUE
+  # ===========================================================================
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: cloudshop_analytics
+        Description: Data lake de CloudShop — tablas registradas por el crawler
+
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn: GlueDatabase
+    Properties:
+      Name: cloudshop-crawler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+      DatabaseName: cloudshop_analytics
+      Targets:
+        S3Targets:
+          - Path: s3://cloudshop-data-lake-2026-utec-mr-cs2032-v2/usuarios/
+          - Path: s3://cloudshop-data-lake-2026-utec-mr-cs2032-v2/direcciones_envio/
+          - Path: s3://cloudshop-data-lake-2026-utec-mr-cs2032-v2/categorias/
+          - Path: s3://cloudshop-data-lake-2026-utec-mr-cs2032-v2/productos/
+          - Path: s3://cloudshop-data-lake-2026-utec-mr-cs2032-v2/inventario/
+          - Path: s3://cloudshop-data-lake-2026-utec-mr-cs2032-v2/movimientos_stock/
+          - Path: s3://cloudshop-data-lake-2026-utec-mr-cs2032-v2/ordenes/
+          - Path: s3://cloudshop-data-lake-2026-utec-mr-cs2032-v2/detalle_ordenes/
+          - Path: s3://cloudshop-data-lake-2026-utec-mr-cs2032-v2/resenas/
+
+  # ===========================================================================
+  # 5. ALB — se crea antes de Amplify para obtener su DNSName
+  # ===========================================================================
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: IGWAttach
+    Properties:
+      Name: cloudshop-alb
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref SGAlb
+
+  # ===========================================================================
+  # 6. API GATEWAY HTTP — termina HTTPS, reenvía todo al ALB por HTTP
+  #    Sin esto, Amplify (HTTPS) no puede llamar al ALB (HTTP) por mixed-content.
+  # ===========================================================================
+
+  APIGateway:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: cloudshop-api
+      ProtocolType: HTTP
+
+  APIGatewayIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref APIGateway
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      IntegrationUri: !Sub "http://${ALB.DNSName}/{proxy}"
+      PayloadFormatVersion: "1.0"
+
+  APIGatewayRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref APIGateway
+      RouteKey: "ANY /{proxy+}"
+      Target: !Sub "integrations/${APIGatewayIntegration}"
+
+  APIGatewayStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref APIGateway
+      StageName: "$default"
+      AutoDeploy: true
+
+  # ===========================================================================
+  # 7. AMPLIFY — usa la URL HTTPS del API Gateway como VITE_API_BASE_URL
+  # ===========================================================================
+
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: cloudshop-frontend
+      Repository: https://github.com/rvcuba-utec/cloudshop-project
+      AccessToken: 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
+      BuildSpec: |
+        version: 1
+        frontend:
+          phases:
+            preBuild:
+              commands:
+                - cd Frontend/frontend
+                - npm ci
+            build:
+              commands:
+                - npm run build
+          artifacts:
+            baseDirectory: Frontend/frontend/dist
+            files:
+              - '**/*'
+          cache:
+            paths:
+              - Frontend/frontend/node_modules/**/*
+      EnvironmentVariables:
+        - Name: VITE_USE_MOCKS
+          Value: "false"
+        - Name: VITE_API_BASE_URL
+          Value: !Sub "https://${APIGateway}.execute-api.${AWS::Region}.amazonaws.com"
+      CustomRules:
+        - Source: /<*>
+          Target: /index.html
+          Status: "200"
+
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: main
+      EnableAutoBuild: true
+
+  # ===========================================================================
+  # 7. EC2 — MV DATOS (MySQL + PostgreSQL + MongoDB + carga de datos)
+  # ===========================================================================
+
+  MVDatos:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - SubnetRTA
+      - PublicRoute
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id}}'
+      InstanceType: t3.micro
+      KeyName: vockey
+      SubnetId: !Ref PublicSubnet
+      PrivateIpAddress: 10.0.1.10
+      SecurityGroupIds:
+        - !Ref SGBd
+      IamInstanceProfile: LabInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+      Tags:
+        - { Key: Name, Value: cloudshop-mv-datos }
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          exec > /var/log/cloudshop-setup.log 2>&1
+          set -x
+
+          apt-get update -y
+          apt-get install -y curl ca-certificates python3-pip git
+
+          curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+          sh /tmp/get-docker.sh
+          systemctl enable --now docker
+          usermod -aG docker ubuntu
+
+          git clone --depth 1 https://github.com/rvcuba-utec/cloudshop-project.git /home/ubuntu/cloudshop
+          chown -R ubuntu:ubuntu /home/ubuntu/cloudshop
+
+          cat > /home/ubuntu/cloudshop/backend/.env << 'ENVEOF'
+          MYSQL_ROOT_PASSWORD=CloudShopRoot2026!
+          MYSQL_DATABASE=cloudshop_catalogo
+          MYSQL_USER=cloud_user
+          MYSQL_PASSWORD=CloudShop2026!
+          PG_USER=cloud_user
+          PG_PASSWORD=CloudShop2026!
+          PG_DATABASE=cloudshop_usuarios
+          DATABASE_URL=postgresql+psycopg2://cloud_user:CloudShop2026!@localhost:5432/cloudshop_usuarios
+          MONGO_URI=mongodb://localhost:27017/cloudshop_ventas
+          ENVEOF
+
+          cd /home/ubuntu/cloudshop/backend
+          docker compose -f docker-compose.datos.yml up -d
+
+          echo "Esperando MySQL..."
+          for i in $(seq 1 60); do
+            docker exec cloudshop-mysql mysqladmin ping -h 127.0.0.1 -uroot -pCloudShopRoot2026! --silent 2>/dev/null && break || true
+            sleep 5
+          done
+
+          echo "Esperando PostgreSQL..."
+          for i in $(seq 1 60); do
+            docker exec cloudshop-postgres pg_isready -U cloud_user -d cloudshop_usuarios 2>/dev/null && break || true
+            sleep 5
+          done
+
+          echo "Esperando MongoDB..."
+          for i in $(seq 1 60); do
+            docker exec cloudshop-mongo mongosh --quiet --eval "db.runCommand('ping').ok" 2>/dev/null && break || true
+            sleep 5
+          done
+
+          docker exec cloudshop-mysql mysql -uroot -pCloudShopRoot2026! -e "CREATE USER IF NOT EXISTS 'ingesta_my'@'%' IDENTIFIED BY 'IngestaReadOnly2026!'; GRANT SELECT ON cloudshop_catalogo.* TO 'ingesta_my'@'%'; FLUSH PRIVILEGES;" || true
+
+          docker exec cloudshop-postgres psql -U cloud_user -d cloudshop_usuarios -c "CREATE USER ingesta_pg WITH PASSWORD 'IngestaReadOnly2026!';" 2>/dev/null || true
+          docker exec cloudshop-postgres psql -U cloud_user -d cloudshop_usuarios -c "GRANT CONNECT ON DATABASE cloudshop_usuarios TO ingesta_pg;" || true
+          docker exec cloudshop-postgres psql -U cloud_user -d cloudshop_usuarios -c "GRANT USAGE ON SCHEMA public TO ingesta_pg;" || true
+          docker exec cloudshop-postgres psql -U cloud_user -d cloudshop_usuarios -c "GRANT SELECT ON ALL TABLES IN SCHEMA public TO ingesta_pg;" || true
+
+          pip3 install pymysql "psycopg[binary]" pymongo python-dotenv
+
+          cd /home/ubuntu/cloudshop
+          MYSQL_HOST=localhost \
+          MYSQL_PORT=3306 \
+          MYSQL_USER=cloud_user \
+          MYSQL_PASSWORD=CloudShop2026! \
+          MYSQL_DATABASE=cloudshop_catalogo \
+          DATABASE_URL=postgresql+psycopg2://cloud_user:CloudShop2026!@localhost:5432/cloudshop_usuarios \
+          MONGO_URI=mongodb://localhost:27017/cloudshop_ventas \
+          python3 Data/scripts/src/scripts/load_csv_bd.py
+
+          echo "=== DATOS VM SETUP COMPLETE ==="
+
+  # ===========================================================================
+  # 8. EC2 — MV APP-1 (5 microservicios, rplica del compose)
+  #    Depende de AmplifyApp para obtener el dominio y configurar CORS
+  # ===========================================================================
+
+  MVApp1:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - SubnetRTA
+      - PublicRoute
+      - AmplifyApp
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id}}'
+      InstanceType: t3.micro
+      KeyName: vockey
+      SubnetId: !Ref PublicSubnet
+      PrivateIpAddress: 10.0.1.11
+      SecurityGroupIds:
+        - !Ref SGApp
+      IamInstanceProfile: LabInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+      Tags:
+        - { Key: Name, Value: cloudshop-mv-app-1 }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          exec > /var/log/cloudshop-setup.log 2>&1
+          set -x
+
+          apt-get update -y
+          apt-get install -y curl ca-certificates git
+
+          curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+          sh /tmp/get-docker.sh
+          systemctl enable --now docker
+          usermod -aG docker ubuntu
+
+          docker login -u rcuba -p VladimirCZ10
+
+          git clone --depth 1 https://github.com/rvcuba-utec/cloudshop-project.git /home/ubuntu/cloudshop
+          chown -R ubuntu:ubuntu /home/ubuntu/cloudshop
+
+          cat > /home/ubuntu/cloudshop/backend/.env << 'ENVEOF'
+          DOCKERHUB_USER=rcuba
+          MYSQL_HOST=10.0.1.10
+          MYSQL_PORT=3306
+          MYSQL_USER=cloud_user
+          MYSQL_PASSWORD=CloudShop2026!
+          MYSQL_DATABASE=cloudshop_catalogo
+          DATABASE_URL=postgresql+psycopg2://cloud_user:CloudShop2026!@10.0.1.10:5432/cloudshop_usuarios
+          MONGO_URI=mongodb://10.0.1.10:27017/cloudshop_ventas
+          JWT_SECRET=cloudshop-jwt-secret-2026-cs2032-utec-production
+          JWT_ALGORITHM=HS256
+          JWT_EXPIRE_MINUTES=60
+          CORS_ORIGINS=https://main.${AmplifyApp.DefaultDomain},http://localhost:5173
+          ADMIN_EMAILS=admin@cloudshop.pe
+          AWS_REGION=us-east-1
+          ATHENA_DATABASE=cloudshop_analytics
+          ATHENA_WORKGROUP=primary
+          ATHENA_OUTPUT_S3=s3://cloudshop-data-lake-2026-utec-mr-cs2032-v2/athena-results/
+          ENVEOF
+
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+          EC2_PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: ${!TOKEN}" "http://169.254.169.254/latest/meta-data/public-ipv4")
+          echo "EC2_PUBLIC_IP=${!EC2_PUBLIC_IP}" >> /home/ubuntu/cloudshop/backend/.env
+
+          cd /home/ubuntu/cloudshop/backend
+          docker compose pull
+          docker compose up -d
+
+          echo "=== APP-1 VM SETUP COMPLETE ==="
+
+  # ===========================================================================
+  # 9. EC2 — MV APP-2 (replica identica de app-1)
+  # ===========================================================================
+
+  MVApp2:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - SubnetRTA
+      - PublicRoute
+      - AmplifyApp
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id}}'
+      InstanceType: t3.micro
+      KeyName: vockey
+      SubnetId: !Ref PublicSubnet
+      PrivateIpAddress: 10.0.1.12
+      SecurityGroupIds:
+        - !Ref SGApp
+      IamInstanceProfile: LabInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+      Tags:
+        - { Key: Name, Value: cloudshop-mv-app-2 }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          exec > /var/log/cloudshop-setup.log 2>&1
+          set -x
+
+          apt-get update -y
+          apt-get install -y curl ca-certificates git
+
+          curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+          sh /tmp/get-docker.sh
+          systemctl enable --now docker
+          usermod -aG docker ubuntu
+
+          docker login -u rcuba -p VladimirCZ10
+
+          git clone --depth 1 https://github.com/rvcuba-utec/cloudshop-project.git /home/ubuntu/cloudshop
+          chown -R ubuntu:ubuntu /home/ubuntu/cloudshop
+
+          cat > /home/ubuntu/cloudshop/backend/.env << 'ENVEOF'
+          DOCKERHUB_USER=rcuba
+          MYSQL_HOST=10.0.1.10
+          MYSQL_PORT=3306
+          MYSQL_USER=cloud_user
+          MYSQL_PASSWORD=CloudShop2026!
+          MYSQL_DATABASE=cloudshop_catalogo
+          DATABASE_URL=postgresql+psycopg2://cloud_user:CloudShop2026!@10.0.1.10:5432/cloudshop_usuarios
+          MONGO_URI=mongodb://10.0.1.10:27017/cloudshop_ventas
+          JWT_SECRET=cloudshop-jwt-secret-2026-cs2032-utec-production
+          JWT_ALGORITHM=HS256
+          JWT_EXPIRE_MINUTES=60
+          CORS_ORIGINS=https://main.${AmplifyApp.DefaultDomain},http://localhost:5173
+          ADMIN_EMAILS=admin@cloudshop.pe
+          AWS_REGION=us-east-1
+          ATHENA_DATABASE=cloudshop_analytics
+          ATHENA_WORKGROUP=primary
+          ATHENA_OUTPUT_S3=s3://cloudshop-data-lake-2026-utec-mr-cs2032-v2/athena-results/
+          ENVEOF
+
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+          EC2_PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: ${!TOKEN}" "http://169.254.169.254/latest/meta-data/public-ipv4")
+          echo "EC2_PUBLIC_IP=${!EC2_PUBLIC_IP}" >> /home/ubuntu/cloudshop/backend/.env
+
+          cd /home/ubuntu/cloudshop/backend
+          docker compose pull
+          docker compose up -d
+
+          echo "=== APP-2 VM SETUP COMPLETE ==="
+
+  # ===========================================================================
+  # 10. EC2 — MV INGESTA (espera que los datos esten cargados, luego sube a S3)
+  # ===========================================================================
+
+  MVIngesta:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - SubnetRTA
+      - PublicRoute
+      - S3DataLake
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id}}'
+      InstanceType: t3.micro
+      KeyName: vockey
+      SubnetId: !Ref PublicSubnet
+      PrivateIpAddress: 10.0.1.20
+      SecurityGroupIds:
+        - !Ref SGIngesta
+      IamInstanceProfile: LabInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+      Tags:
+        - { Key: Name, Value: cloudshop-mv-ingesta }
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          exec > /var/log/cloudshop-setup.log 2>&1
+          set -x
+
+          apt-get update -y
+          apt-get install -y curl ca-certificates git netcat-openbsd
+
+          curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+          sh /tmp/get-docker.sh
+          systemctl enable --now docker
+          usermod -aG docker ubuntu
+
+          docker login -u rcuba -p VladimirCZ10
+
+          git clone --depth 1 https://github.com/rvcuba-utec/cloudshop-project.git /home/ubuntu/cloudshop
+          chown -R ubuntu:ubuntu /home/ubuntu/cloudshop
+
+          echo "DOCKERHUB_USER=rcuba" > /home/ubuntu/cloudshop/Ingesta/.env
+
+          cat > /home/ubuntu/cloudshop/Ingesta/ingesta-catalogo/.env << 'ENVEOF'
+          MYSQL_HOST=10.0.1.10
+          MYSQL_PORT=3306
+          MYSQL_DB=cloudshop_catalogo
+          MYSQL_USER=ingesta_my
+          MYSQL_PASSWORD=IngestaReadOnly2026!
+          S3_BUCKET=cloudshop-data-lake-2026-utec-mr-cs2032-v2
+          ENVEOF
+
+          cat > /home/ubuntu/cloudshop/Ingesta/ingesta-usuarios/.env << 'ENVEOF'
+          POSTGRES_HOST=10.0.1.10
+          POSTGRES_PORT=5432
+          POSTGRES_DB=cloudshop_usuarios
+          POSTGRES_USER=ingesta_pg
+          POSTGRES_PASSWORD=IngestaReadOnly2026!
+          S3_BUCKET=cloudshop-data-lake-2026-utec-mr-cs2032-v2
+          ENVEOF
+
+          cat > /home/ubuntu/cloudshop/Ingesta/ingesta-ventas/.env << 'ENVEOF'
+          MONGO_URI=mongodb://10.0.1.10:27017/cloudshop_ventas
+          MONGO_DB=cloudshop_ventas
+          S3_BUCKET=cloudshop-data-lake-2026-utec-mr-cs2032-v2
+          ENVEOF
+
+          echo "Esperando que los puertos de BD esten accesibles en 10.0.1.10..."
+          until nc -z 10.0.1.10 3306 2>/dev/null && nc -z 10.0.1.10 5432 2>/dev/null && nc -z 10.0.1.10 27017 2>/dev/null; do
+            echo "Puertos aun cerrados, reintentando en 15s..."
+            sleep 15
+          done
+          echo "Puertos de BD accesibles. Esperando 20 min para que termine la carga de datos..."
+          sleep 1200
+
+          cd /home/ubuntu/cloudshop/Ingesta
+          docker compose pull
+          docker compose up
+
+          echo "=== INGESTA COMPLETE ==="
+
+  # ===========================================================================
+  # 11. TARGET GROUPS del ALB (uno por microservicio)
+  #     Registran ambas MV de aplicacion como targets
+  # ===========================================================================
+
+  TGUsuarios:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: cloudshop-tg-usuarios
+      Port: 8000
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckPort: "8000"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Targets:
+        - { Id: !Ref MVApp1, Port: 8000 }
+        - { Id: !Ref MVApp2, Port: 8000 }
+
+  TGCatalogo:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: cloudshop-tg-catalogo
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckPort: "8080"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Targets:
+        - { Id: !Ref MVApp1, Port: 8080 }
+        - { Id: !Ref MVApp2, Port: 8080 }
+
+  TGAnalitica:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: cloudshop-tg-analitica
+      Port: 8001
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckPort: "8001"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Targets:
+        - { Id: !Ref MVApp1, Port: 8001 }
+        - { Id: !Ref MVApp2, Port: 8001 }
+
+  TGVentas:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: cloudshop-tg-ventas
+      Port: 8002
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckPort: "8002"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Targets:
+        - { Id: !Ref MVApp1, Port: 8002 }
+        - { Id: !Ref MVApp2, Port: 8002 }
+
+  TGOrdenes:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: cloudshop-tg-ordenes
+      Port: 8003
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckPort: "8003"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Targets:
+        - { Id: !Ref MVApp1, Port: 8003 }
+        - { Id: !Ref MVApp2, Port: 8003 }
+
+  # ===========================================================================
+  # 12. ALB LISTENER + REGLAS DE ENRUTAMIENTO POR PATH
+  # ===========================================================================
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TGCatalogo
+
+  # Prioridad 1: /usuarios/*/ventas → MS3 (mas especifico que /usuarios/*)
+  RuleUsuariosVentas:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          Values: [ "/usuarios/*/ventas*" ]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGVentas
+
+  # Prioridad 2: /productos/*/resenas → MS3
+  RuleProductosResenas:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 2
+      Conditions:
+        - Field: path-pattern
+          Values: [ "/productos/*/resenas*" ]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGVentas
+
+  # Prioridad 3: /usuarios/* → MS1
+  RuleUsuarios:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 3
+      Conditions:
+        - Field: path-pattern
+          Values: [ "/usuarios/*" ]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGUsuarios
+
+  # Prioridad 4: /api/catalogo/* → MS2
+  RuleCatalogo:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 4
+      Conditions:
+        - Field: path-pattern
+          Values: [ "/api/catalogo/*" ]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGCatalogo
+
+  # Prioridad 5: /ventas/* → MS3
+  RuleVentas:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 5
+      Conditions:
+        - Field: path-pattern
+          Values: [ "/ventas/*" ]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGVentas
+
+  # Prioridad 6: /ordenes/* → MS4
+  RuleOrdenes:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 6
+      Conditions:
+        - Field: path-pattern
+          Values: [ "/ordenes/*" ]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGOrdenes
+
+  # Prioridad 7: /analitica/* → MS5
+  RuleAnalitica:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 7
+      Conditions:
+        - Field: path-pattern
+          Values: [ "/analitica/*" ]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGAnalitica
+
+# =============================================================================
+# OUTPUTS — aparecen en la pestana "Outputs" del stack en CloudFormation
+# =============================================================================
+
+Outputs:
+
+  APIGatewayUrl:
+    Description: URL HTTPS del API Gateway — la que usa el frontend para llamar al backend
+    Value: !Sub "https://${APIGateway}.execute-api.${AWS::Region}.amazonaws.com"
+
+  ALBUrl:
+    Description: URL interna del ALB (solo referencia, el frontend usa APIGatewayUrl)
+    Value: !Sub "http://${ALB.DNSName}"
+
+  AmplifyUrl:
+    Description: URL del frontend (Amplify — disponible despues del primer build)
+    Value: !Sub "https://main.${AmplifyApp.DefaultDomain}"
+
+  InstruccionGlue:
+    Description: Paso final — ejecutar el crawler una vez que la ingesta haya terminado
+    Value: "AWS Console > Glue > Crawlers > cloudshop-crawler > Run crawler"

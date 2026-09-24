@@ -118,3 +118,21 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+
+  # Swagger UI centralizado — agrega los OpenAPI de los 3 servicios FastAPI.
+  # MS2 (Go) y MS3 (Node) no generan OpenAPI automatico.
+  # EC2_PUBLIC_IP se escribe en .env al arrancar la VM (ver UserData del YAML de infraestructura).
+  swagger-ui:
+    image: swaggerapi/swagger-ui
+    container_name: cloudshop-swagger-ui
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    environment:
+      URLS: >-
+        [{"name":"MS1 Usuarios","url":"http://${EC2_PUBLIC_IP}:8000/openapi.json"},{"name":"MS4 Ordenes","url":"http://${EC2_PUBLIC_IP}:8003/openapi.json"},{"name":"MS5 Analitica","url":"http://${EC2_PUBLIC_IP}:8001/openapi.json"}]
+      URLS_PRIMARY_NAME: "MS1 Usuarios"
+    depends_on:
+      - usuarios
+      - ordenes
+      - analitica
